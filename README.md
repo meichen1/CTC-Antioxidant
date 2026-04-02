@@ -56,19 +56,15 @@ Approach:
 - Bayesian logistic model via Stan
 - fallback crude/frequentist OR when Stan fails
 - subgroup analyses for selected demographic and clinical strata
-- auto-generated markdown report per outcome
+- markdown report per outcome
 
-Outputs:
-- binary markdown reports in results_antiox, for example:
-  - binary_secd_report_pdd_recover_first_change_to_1.md
-  - binary_secd_report_pdd_recover_sustain_change_to_1.md
 
 ## Run
 
 From repository root:
 
-python antiox_primary_250611.py  
-python antiox_secd_bin_251007.py
+python antiox_primary_2603.py  
+python antiox_secd_bin_2603.py
 
 ## Environment
 
