@@ -19,6 +19,7 @@ Thumbs.db
 *.log
 
 # Add your specific folders/files below:
+.gitignore
 .env
 archiv_ctc_antiox/
 antiox_ae.py
