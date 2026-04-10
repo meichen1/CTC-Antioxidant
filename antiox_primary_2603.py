@@ -13,6 +13,10 @@ import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
 
+# Prior hyperparameter constants (outcome-specific intercept location)
+ALPHA_LOC_HOSP = -3.48      # logit(0.03) ≈ -3.48, appropriate for ~3% hospitalization rate
+ALPHA_LOC_RECOVERY = 0.0    # logit(0.50) = 0, broad neutral prior for high recovery rates
+
 try:
     from ctc_antiox.src_helper import first_change_to_1, ret_first_alleviation, ret_sustain_alleviation, sustain_change_to_1
 except ModuleNotFoundError:
@@ -44,9 +48,9 @@ def remove_rcc_ids(df):
     rcc_ids_in_antiox = (
         df[df['redcap_event_name'] == 'Randomization']
         .sort_values('rand_date')
-        .head(5)['participant_id'].tolist()
+        .head(4)['participant_id'].tolist()
     )
-    rcc_ids_in_antiox.pop(3)
+    # rcc_ids_in_antiox.pop(3)
     print(f"Removing RCC IDs: {rcc_ids_in_antiox}")
     return df[~df['participant_id'].isin(rcc_ids_in_antiox)]
 
@@ -254,9 +258,6 @@ def prepare_primary_outcome_dataset(antiox_dd_agg, antiox_followup, antiox_rando
     antiox_primary['dem_vaccination_status'] = (antiox_primary['dem_vaccination_status'] > 0).astype(int)
     antiox_primary['rand_group'] = antiox_primary['rand_group'].map({'Antioxidant': 1, 'Usual Care': 0})
     
-    # # Remove any rows with missing values
-    # antiox_primary = antiox_primary.dropna(axis=0, how='any')
-    
     print(f"Primary outcome dataset shape: {antiox_primary.shape}")
     return antiox_primary
 
@@ -293,13 +294,39 @@ def prepare_early_recovery_dataset(antiox_dd_agg, antiox_random, antiox_baseline
     return antiox_earlysus
 
 
+def calculate_mean_recovery_rate(antiox_dd_agg, recovery_cols=None):
+    """Calculate pooled binary recovery-by-day-14 rate for each recovery endpoint.
+    Useful for setting endpoint-specific intercept priors (logit of the mean rate).
+    """
+    if recovery_cols is None:
+        recovery_cols = [
+            'pdd_recover_first_change_to_1', 'pdd_recover_sustain_change_to_1',
+            'pdd_feel_today_ret_first_alleviation', 'pdd_feel_today_ret_sustain_alleviation',
+            'pdd_return_health_first_change_to_1', 'pdd_return_health_sustain_change_to_1',
+            'pdd_return_activity_first_change_to_1', 'pdd_return_activity_sustain_change_to_1',
+        ]
+    print("\n=== Mean Recovery Rates by Day 14 (Overall Sample) ===")
+    rates = {}
+    for col in recovery_cols:
+        if col not in antiox_dd_agg.columns:
+            continue
+        valid_mask = antiox_dd_agg[col].notna()
+        n_valid = valid_mask.sum()
+        n_recovered = (antiox_dd_agg.loc[valid_mask, col] <= 14).sum()
+        rate = n_recovered / n_valid if n_valid > 0 else np.nan
+        logit_rate = np.log(rate / (1 - rate)) if (not np.isnan(rate) and 0 < rate < 1) else np.nan
+        rates[col] = {'n': int(n_valid), 'n_recovered': int(n_recovered), 'rate': rate, 'logit_rate': logit_rate}
+        print(f"  {col}: {n_recovered}/{n_valid} ({rate*100:.1f}%), logit = {logit_rate:.3f}")
+    return rates
+
+
 # ============================================================================
 # ADDITIONAL IMPORTS FOR ANALYSIS
 # ============================================================================
 
 from cmdstanpy import CmdStanModel
-from sklearn.linear_model import LogisticRegression
-# from scipy import stats
+# from sklearn.linear_model import LogisticRegression
+
 
 
 # ============================================================================
@@ -323,7 +350,7 @@ def prepare_analysis_data(antiox_dataset, outcome_col):
     Prepare data for analysis.
     """
     
-    analysis_data = antiox_dataset[antiox_dataset[outcome_col].notna()].copy()
+    analysis_data = antiox_dataset[antiox_dataset[outcome_col].notna() & antiox_dataset['rand_group'].notna()].copy()
     
     print(f"Analysis dataset shape: {analysis_data.shape}")
     print(f"Outcome distribution: {analysis_data[outcome_col].sum()} / {len(analysis_data)} ({analysis_data[outcome_col].mean()*100:.1f}%)")
@@ -377,26 +404,30 @@ def run_stan_analysis(stan_data, model, superiority_direction='lo', model_name="
 
 
 def run_frequentist_fallback(Z, X1_std, X2_std, X3_std, y):
-    """Frequentist fallback using logistic regression."""
+    """Unpenalized frequentist fallback using statsmodels logistic regression."""
     try:
-        lr = LogisticRegression(fit_intercept=True, max_iter=1000)
-        X_lr = np.column_stack([Z.flatten(), X1_std, X2_std, X3_std])
-        lr.fit(X_lr, y)
-        
+        import statsmodels.api as sm
+        X_lr = np.column_stack([np.ones(len(y)), Z.flatten(), X1_std, X2_std, X3_std])
+        logit_model = sm.Logit(y, X_lr)
+        result = logit_model.fit(disp=0, maxiter=200)
+        theta_mean = float(result.params[1])
+        theta_se = float(result.bse[1])
+        ci_low = theta_mean - 1.96 * theta_se
+        ci_high = theta_mean + 1.96 * theta_se
         return {
-            'theta_mean': lr.coef_[0][0],
-            'ci_low': np.nan,
-            'ci_high': np.nan,
+            'theta_mean': theta_mean,
+            'ci_low': ci_low,
+            'ci_high': ci_high,
             'theta_samples': None,
             'probability_superiority': np.nan,
-            'method': 'Frequentist (LogReg)'
+            'method': 'Frequentist (Unpenalized LogReg)'
         }
     except Exception as e:
         print(f"Frequentist fallback failed: {e}")
         return None
 
 
-def panoramic_analysis_hospitalization(antiox_primary, model, stan_model_available):
+def panoramic_analysis_hospitalization(antiox_primary, model, stan_model_available, model_reg=None):
     """Run PANORAMIC-style analysis for hospitalization outcome."""
     print("\n" + "="*80)
     print("PANORAMIC-STYLE ANALYSIS - HOSPITALIZATION")
@@ -437,8 +468,17 @@ def panoramic_analysis_hospitalization(antiox_primary, model, stan_model_availab
         
         crosstab = pd.crosstab(analysis_data['rand_group'], analysis_data['pdd_hospital_binary'], margins=True)
         print(f"\nCross-tabulation:\n{crosstab}")
-    
-    return analysis_data, results
+
+    # Sensitivity analysis: regularizing normal(0,1) priors
+    results_reg = None
+    if model_reg is not None and stan_model_available:
+        print(f"\n[Sensitivity - Regularizing Priors (alpha_loc={ALPHA_LOC_HOSP})]")
+        stan_data_reg = {**stan_data, 'alpha_loc': ALPHA_LOC_HOSP}
+        results_reg = run_stan_analysis(stan_data_reg, model_reg, 'lo', "Regularizing Hospitalization")
+        if results_reg:
+            print(f"  Reg. OR: {np.exp(results_reg['theta_mean']):.3f} [{np.exp(results_reg['ci_low']):.3f}, {np.exp(results_reg['ci_high']):.3f}]")
+
+    return analysis_data, results, results_reg
 
 
 # def cantreaycovid_analysis_hospitalization(antiox_primary, model, stan_model_available):
@@ -488,7 +528,7 @@ def panoramic_analysis_hospitalization(antiox_primary, model, stan_model_availab
 #     return analysis_data, results
 
 
-def early_recovery_analysis(antiox_earlysus, model, stan_model_available):
+def early_recovery_analysis(antiox_earlysus, model, stan_model_available, model_reg=None):
     """Run analysis for early sustained recovery outcome."""
     print("\n" + "="*80)
     print("EARLY SUSTAINED RECOVERY ANALYSIS (Day 14)")
@@ -531,8 +571,17 @@ def early_recovery_analysis(antiox_earlysus, model, stan_model_available):
         
         crosstab = pd.crosstab(analysis_data['rand_group'], analysis_data['pdd_recover_sustain_binary'], margins=True)
         print(f"\nCross-tabulation:\n{crosstab}")
-    
-    return analysis_data, results
+
+    # Sensitivity analysis: regularizing normal(0,1) priors
+    results_reg = None
+    if model_reg is not None and stan_model_available:
+        print(f"\n[Sensitivity - Regularizing Priors (alpha_loc={ALPHA_LOC_RECOVERY})]")
+        stan_data_reg = {**stan_data, 'alpha_loc': ALPHA_LOC_RECOVERY}
+        results_reg = run_stan_analysis(stan_data_reg, model_reg, 'hi', "Regularizing Recovery")
+        if results_reg:
+            print(f"  Reg. OR: {np.exp(results_reg['theta_mean']):.3f} [{np.exp(results_reg['ci_low']):.3f}, {np.exp(results_reg['ci_high']):.3f}]")
+
+    return analysis_data, results, results_reg
 
 
 
@@ -594,7 +643,7 @@ def subgroup_analysis(antiox_primary_subgroup, model, stan_model_available):
         }
         
         if stan_model_available:
-            results = run_stan_analysis(stan_data_sub, model, f"Subgroup {subgroup_name}")
+            results = run_stan_analysis(stan_data_sub, model, 'lo', f"Subgroup {subgroup_name}")
         else:
             results = run_frequentist_fallback(Z_sub, X1_std_sub, X2_std_sub, X3_std_sub, y_sub)
         
@@ -643,6 +692,7 @@ if __name__ == '__main__':
     antiox_followup = extract_followup_data(df_antiox)
     antiox_dd, pdd_col_names = extract_diary_data(df_antiox)
     antiox_dd_agg = aggregate_diary_data(antiox_dd, pdd_col_names)
+    calculate_mean_recovery_rate(antiox_dd_agg)
     
     # Prepare analysis datasets
     antiox_primary = prepare_primary_outcome_dataset(antiox_dd_agg, antiox_followup, antiox_random, antiox_baseline)
@@ -652,15 +702,17 @@ if __name__ == '__main__':
     # COMPILE STAN MODEL
     # ========================================================================
     
-    model, stan_model_available = compile_stan_model('/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code.stan')
+    model_hosp, stan_model_available = compile_stan_model('/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code.stan')
+    model_recovery, _ = compile_stan_model('/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code Recovery.stan')
+    model_reg, _ = compile_stan_model('/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code Regularizing.stan')
     
     # ========================================================================
     # PRIMARY OUTCOMES ANALYSIS
     # ========================================================================
     
     # Hospitalization (PANORAMIC-style)
-    hosp_pano_data, hosp_pano_results = panoramic_analysis_hospitalization(
-        antiox_primary, model, stan_model_available
+    hosp_pano_data, hosp_pano_results, hosp_reg_results = panoramic_analysis_hospitalization(
+        antiox_primary, model_hosp, stan_model_available, model_reg=model_reg
     )
     
     # # Hospitalization (CanTreatCOVID-style)
@@ -669,8 +721,8 @@ if __name__ == '__main__':
     # )
     
     # Early Sustained Recovery
-    recovery_data, recovery_results = early_recovery_analysis(
-        antiox_earlysus, model, stan_model_available
+    recovery_data, recovery_results, recovery_reg_results = early_recovery_analysis(
+        antiox_earlysus, model_recovery, stan_model_available, model_reg=model_reg
     )
     
     
@@ -679,32 +731,67 @@ if __name__ == '__main__':
     # ========================================================================
     
     print("\n" + "="*80)
-    print("SAVING RESULTS")
+    print("SAVING PRIMARY RESULTS")
     print("="*80)
     
+    res_rows = []
     # Primary analysis results
     if hosp_pano_results and recovery_results:
-        results_summary = {
-            'analysis_type': ['PANORAMIC_hosp', 'EarlySustainedRecovery'],
-            'n_participants': [len(hosp_pano_data), len(recovery_data)],
-            'n_events_antiox': [hosp_pano_data[hosp_pano_data['rand_group'] == 1]['pdd_hospital_binary'].sum(),
-                               recovery_data[recovery_data['rand_group'] == 1]['pdd_recover_sustain_binary'].sum()],
-            'n_events_control': [hosp_pano_data[hosp_pano_data['rand_group'] == 0]['pdd_hospital_binary'].sum(),
-                                 recovery_data[recovery_data['rand_group'] == 0]['pdd_recover_sustain_binary'].sum()],
-            'n_antiox': [hosp_pano_data['rand_group'].sum(), recovery_data['rand_group'].sum()],
-            'n_control': [len(hosp_pano_data) - hosp_pano_data['rand_group'].sum(),
-                          len(recovery_data) - recovery_data['rand_group'].sum()],
-            'log_or': [hosp_pano_results['theta_mean'], recovery_results['theta_mean']],
-            'odds_ratio': [np.exp(hosp_pano_results['theta_mean']), np.exp(recovery_results['theta_mean'])],
-            'ci_lower': [np.exp(hosp_pano_results['ci_low']), np.exp(recovery_results['ci_low'])],
-            'ci_upper': [np.exp(hosp_pano_results['ci_high']), np.exp(recovery_results['ci_high'])],
-            'probability_superiority': [hosp_pano_results['probability_superiority'], recovery_results['probability_superiority']],
-            'method': [hosp_pano_results['method'], recovery_results['method']]
-        }
+        res_rows.append({
+            'analysis_type': 'PANORAMIC_hosp',
+            'n_participants': len(hosp_pano_data),
+            'n_events_antiox': hosp_pano_data[hosp_pano_data['rand_group'] == 1]['pdd_hospital_binary'].sum(),  
+            'n_events_control': hosp_pano_data[hosp_pano_data['rand_group'] == 0]['pdd_hospital_binary'].sum(),
+            'n_antiox': hosp_pano_data['rand_group'].sum(),
+            'n_control': len(hosp_pano_data) - hosp_pano_data['rand_group'].sum(),
+            'log_or': hosp_pano_results['theta_mean'],
+            'odds_ratio': np.exp(hosp_pano_results['theta_mean']),
+            'ci_lower': np.exp(hosp_pano_results['ci_low']),
+            'ci_upper': np.exp(hosp_pano_results['ci_high']),
+            'probability_superiority': hosp_pano_results['probability_superiority'],
+            'method': hosp_pano_results['method']
+        })
+        res_rows.append({
+            'analysis_type': 'EarlySustainedRecovery',
+            'n_participants': len(recovery_data),
+            'n_events_antiox': recovery_data[recovery_data['rand_group'] == 1]['pdd_recover_sustain_binary'].sum(),  
+            'n_events_control': recovery_data[recovery_data['rand_group'] == 0]['pdd_recover_sustain_binary'].sum(),
+            'n_antiox': recovery_data['rand_group'].sum(),
+            'n_control': len(recovery_data) - recovery_data['rand_group'].sum(),
+            'log_or': recovery_results['theta_mean'],
+            'odds_ratio': np.exp(recovery_results['theta_mean']),
+            'ci_lower': np.exp(recovery_results['ci_low']),
+            'ci_upper': np.exp(recovery_results['ci_high']),
+            'probability_superiority': recovery_results['probability_superiority'],
+            'method': recovery_results['method']
+        })
         
-        results_df = pd.DataFrame(results_summary)
+    ## Save regularizing sensitivity results # prior using normal(0,1) 
+    if hosp_reg_results:
+        res_rows.append({
+            'analysis_type': 'PANORAMIC_hosp_regularizing',
+            'log_or': hosp_reg_results['theta_mean'],
+            'odds_ratio': np.exp(hosp_reg_results['theta_mean']),
+            'ci_lower': np.exp(hosp_reg_results['ci_low']),
+            'ci_upper': np.exp(hosp_reg_results['ci_high']),
+            'probability_superiority': hosp_reg_results['probability_superiority'],
+            'method': hosp_reg_results['method']
+        })
+    if recovery_reg_results:
+        res_rows.append({
+            'analysis_type': 'EarlySustainedRecovery_regularizing',
+            'log_or': recovery_reg_results['theta_mean'],
+            'odds_ratio': np.exp(recovery_reg_results['theta_mean']),
+            'ci_lower': np.exp(recovery_reg_results['ci_low']),
+            'ci_upper': np.exp(recovery_reg_results['ci_high']),
+            'probability_superiority': recovery_reg_results['probability_superiority'],
+            'method': recovery_reg_results['method']
+        })
+    if res_rows:
+        results_df = pd.DataFrame(res_rows)
         results_df.to_csv('/workspaces/CTC_covid/py_src/results_antiox/antiox_primary_analysis_results.csv', index=False, float_format='%.3f')
         print(f"✓ Primary analysis results saved")
+
     
     
     # ========================================================================
@@ -716,9 +803,9 @@ if __name__ == '__main__':
         on='participant_id', 
         how='left'
     )
-    subgroup_results_list = subgroup_analysis(antiox_primary_subgroup, model, stan_model_available)
+    subgroup_results_list = subgroup_analysis(antiox_primary_subgroup, model_hosp, stan_model_available)
     
-    # Subgroup analysis results
+    ## Subgroup analysis results
     if subgroup_results_list:
         subgroup_df = pd.DataFrame(subgroup_results_list)
         subgroup_df.to_csv('/workspaces/CTC_covid/py_src/results_antiox/antiox_primary_subgroup.csv', index=False, float_format='%.3f')

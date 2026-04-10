@@ -1,6 +1,6 @@
 //
-// This Stan program defines a simple model, with a
-// vector of values 'y' modeled as normally distributed
+// This is the stan code for CTC primary result: hospitalization or death within 28 days (event rate ~0.03)
+// This Stan program defines a simple model, with a vector of values 'y' modeled as normally distributed
 // with mean 'mu' and standard deviation 'sigma'.
 //
 // Learn more about model development with Stan at:

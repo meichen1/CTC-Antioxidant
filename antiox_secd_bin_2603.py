@@ -3,7 +3,6 @@
 # For each recovery outcome, create binary variable: recovered by day 14 (yes=1, no=0)
 # Report: numbers (percentage), median time (IQR), odds ratio (95%CI), probability of superiority
 
-
 import pandas as pd
 import numpy as np
 from cmdstanpy import CmdStanModel
@@ -12,8 +11,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # from src_helper import first_change_to_1, ret_first_alleviation, ret_sustain_alleviation, sustain_change_to_1, ret_series, ret_indexof1
-from py_src.ctc_antiox.antiox_primary_2603 import load_and_clean_raw_data, extract_randomization_data, extract_baseline_data, extract_followup_data, extract_diary_data, aggregate_diary_data, standardize_covariates
-
+from antiox_primary_2603 import load_and_clean_raw_data, extract_randomization_data, extract_baseline_data, extract_followup_data, extract_diary_data, aggregate_diary_data, standardize_covariates
+STAN_FILE_RECOVERY = "/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code Recovery.stan"
+STAN_FILE_REGULARIZING = "/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code Regularizing.stan"
 
 def secondary_binary_analysis(antiox_dd_agg, 
                               antiox_baseline, 
@@ -114,7 +114,13 @@ def secondary_binary_analysis(antiox_dd_agg,
             }
         return stats
     
+    results = {}
     descriptive_stats = calculate_descriptive_stats(analysis_data, timerecovery_col)
+    # Add descriptive stats to results
+    results['descriptive_stats'] = descriptive_stats
+    results['outcome_col'] = timerecovery_col
+    results['max_time'] = max_time
+    
     
     # Prepare variables for Stan analysis
     y = analysis_data['recovered_by_day14'].values.astype(int)
@@ -135,11 +141,10 @@ def secondary_binary_analysis(antiox_dd_agg,
     # age_group_std = age_group - np.mean(age_group)
     # vaccination_status_ctc_std = vaccination_status - np.mean(vaccination_status)
     
-    results = {}
+    
     try:
         # First check if Stan is available
-        stan_file = "/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code.stan"
-        model = CmdStanModel(stan_file=stan_file)
+        model = CmdStanModel(stan_file=STAN_FILE_RECOVERY)
         
         # PANORAMIC analysis
         stan_data_pan = {
@@ -203,16 +208,38 @@ def secondary_binary_analysis(antiox_dd_agg,
         }
         
         print("Stan analysis completed successfully")
+
+        # Regularizing prior sensitivity analysis (normal(0,1) for theta and bbeta)
+        try:
+            model_reg = CmdStanModel(stan_file=STAN_FILE_REGULARIZING)
+            stan_data_reg = {**stan_data_pan, 'alpha_loc': 0.0}
+            print("Running regularizing prior sensitivity analysis...")
+            fit_reg = model_reg.sample(data=stan_data_reg, 
+                                       chains=4, 
+                                       iter_sampling=20000, 
+                                       iter_warmup=10000, 
+                                       seed=42)
+            
+            draws_reg = fit_reg.draws_pd()
+            theta_reg = draws_reg['theta[1]']
+            or_samples_reg = np.exp(theta_reg)
+            results['regularizing'] = {
+                'or_mean': float(np.mean(or_samples_reg)),
+                'or_ci_lower': float(np.percentile(or_samples_reg, 2.5)),
+                'or_ci_upper': float(np.percentile(or_samples_reg, 97.5)),
+                'prob_superiority': float(np.mean(or_samples_reg > 1))
+            }
+            print("Regularizing sensitivity completed successfully")
+        except Exception as e_reg:
+            print(f"Regularizing sensitivity failed: {e_reg}")
+            
         
     except Exception as e:
         print(f"Stan analysis failed: {e}")
         print("Using fallback frequentist logistic regression analysis...")
         
         # Fallback to scipy logistic regression with bootstrap for confidence intervals
-        from sklearn.linear_model import LogisticRegression
         from scipy import stats
-        import warnings
-        warnings.filterwarnings('ignore')
         
         try:
             # Frequentist analysis as fallback
@@ -254,6 +281,7 @@ def secondary_binary_analysis(antiox_dd_agg,
                     }
                 }
                 print(f"Frequentist analysis completed: OR = {or_crude:.3f} (95% CI: {or_ci_lower:.3f}-{or_ci_upper:.3f})")
+            
             else:
                 # Handle zero cells with continuity correction
                 or_crude = ((treat_success + 0.5) * (control_fail + 0.5)) / ((treat_fail + 0.5) * (control_success + 0.5))
@@ -271,21 +299,16 @@ def secondary_binary_analysis(antiox_dd_agg,
         except Exception as e2:
             print(f"Fallback analysis also failed: {e2}")
             results = {'analysis_error': f"Both Stan and fallback failed: {str(e)}; {str(e2)}"}
-            
-    # Add descriptive stats to results
-    results['descriptive_stats'] = descriptive_stats
-    results['outcome_col'] = timerecovery_col
-    results['max_time'] = max_time
     
     # # Save analysis dataset
     # analysis_data.to_csv(os.path.join(output_dir, f'binary_analysis_dataset_{timerecovery_col}.csv'), index=False)
-    
+
     # ---------------------------------------
     # Perform subgroup analysis
     # ---------------------------------------
     if subgroup_analysis:
-        stan_file = "/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code.stan"
-        subgroup_results = subgroup_binary_analysis(analysis_data, timerecovery_col, 'recovered_by_day14', stan_file, max_time)
+        model = CmdStanModel(stan_file=STAN_FILE_RECOVERY)
+        subgroup_results = subgroup_binary_analysis(analysis_data, timerecovery_col, 'recovered_by_day14', model)
     
     # ---------------------------------------
     # Create comprehensive markdown report
@@ -324,6 +347,11 @@ def secondary_binary_analysis(antiox_dd_agg,
             f.write("### PANORAMIC-style Analysis\n")
             f.write(f"- **Odds Ratio:** {results['panoramic']['or_mean']:.3f} (95% CI: {results['panoramic']['or_ci_lower']:.3f}-{results['panoramic']['or_ci_upper']:.3f})\n")
             f.write(f"- **Probability of Superiority:** {results['panoramic']['prob_superiority']:.3f}\n\n")
+
+            if 'regularizing' in results:
+                f.write("### Sensitivity Analysis (Regularizing Priors: normal(0,1))\n")
+                f.write(f"- **Odds Ratio:** {results['regularizing']['or_mean']:.3f} (95% CI: {results['regularizing']['or_ci_lower']:.3f}-{results['regularizing']['or_ci_upper']:.3f})\n")
+                f.write(f"- **Probability of Superiority:** {results['regularizing']['prob_superiority']:.3f}\n\n")
             
             # f.write("### CanTreatCOVID-style Analysis\n")
             # f.write(f"- **Odds Ratio:** {results['cantreatcovid']['or_mean']:.3f} (95% CI: {results['cantreatcovid']['or_ci_lower']:.3f}-{results['cantreatcovid']['or_ci_upper']:.3f})\n")
@@ -371,39 +399,39 @@ def secondary_binary_analysis(antiox_dd_agg,
             f.write(f"The probability that antioxidant is superior to usual care is {prob_freq:.3f}.\n\n")
         
         
-        # Subgroup results to md
-        if subgroup_analysis and subgroup_results:
-            f.write("## Subgroup Analyses\n\n")
-            f.write("| Subgroup | N | Antioxidant | Usual Care | antiox Recovered | % antiox Recovered | uc Recovered | % uc Recovered | Log-OR | OR | 95% CI | Prob(OR>1) | Notes |\n")
-            f.write("|---|---|---|---|---|---|---|---|---|---|---|\n")
+        # # Subgroup results to md
+        # if subgroup_analysis and subgroup_results:
+        #     f.write("## Subgroup Analyses\n\n")
+        #     f.write("| Subgroup | N | Antioxidant | Usual Care | antiox Recovered | % antiox Recovered | uc Recovered | % uc Recovered | Log-OR | OR | 95% CI | Prob(OR>1) | Notes |\n")
+        #     f.write("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
             
-            for subgroup_result in subgroup_results:
-                n = subgroup_result['n']
-                n_ant = subgroup_result['n_antioxidant']
-                n_uc = subgroup_result['n_usual_care']
-                antiox_rec = int(subgroup_result['antiox_recovered'])
-                antiox_pct = subgroup_result['antiox_pct_recovered']
-                uc_rec = int(subgroup_result['uc_recovered'])
-                uc_pct = subgroup_result['uc_pct_recovered']
-                log_or_val = subgroup_result['log_or']
-                or_val = subgroup_result['or']
-                ci_lower = subgroup_result['ci_lower']
-                ci_upper = subgroup_result['ci_upper']
-                prob_sup = subgroup_result['prob_superiority']
-                note = subgroup_result.get('note', '')
+        #     for subgroup_result in subgroup_results:
+        #         n = subgroup_result['n']
+        #         n_ant = subgroup_result['n_antioxidant']
+        #         n_uc = subgroup_result['n_usual_care']
+        #         antiox_rec = int(subgroup_result['antiox_recovered'])
+        #         antiox_pct = subgroup_result['antiox_pct_recovered']
+        #         uc_rec = int(subgroup_result['uc_recovered'])
+        #         uc_pct = subgroup_result['uc_pct_recovered']
+        #         log_or_val = subgroup_result['log_or']
+        #         or_val = subgroup_result['or']
+        #         ci_lower = subgroup_result['ci_lower']
+        #         ci_upper = subgroup_result['ci_upper']
+        #         prob_sup = subgroup_result['prob_superiority']
+        #         note = subgroup_result.get('note', '')
                 
-                # Format values
-                log_or_str = f"{log_or_val:.3f}" if not np.isnan(log_or_val) else "N/A"
-                or_str = f"{or_val:.3f}" if not np.isnan(or_val) else "N/A"
-                ci_str = f"({ci_lower:.3f}-{ci_upper:.3f})" if not np.isnan(ci_lower) and not np.isnan(ci_upper) else "N/A"
-                prob_str = f"{prob_sup:.3f}" if not np.isnan(prob_sup) else "N/A"
+        #         # Format values
+        #         log_or_str = f"{log_or_val:.3f}" if not np.isnan(log_or_val) else "N/A"
+        #         or_str = f"{or_val:.3f}" if not np.isnan(or_val) else "N/A"
+        #         ci_str = f"({ci_lower:.3f}-{ci_upper:.3f})" if not np.isnan(ci_lower) and not np.isnan(ci_upper) else "N/A"
+        #         prob_str = f"{prob_sup:.3f}" if not np.isnan(prob_sup) else "N/A"
 
-                f.write(f"| {subgroup_result['subgroup']} | {n} | {n_ant} | {n_uc} | {antiox_rec} | {antiox_pct:.2f}% | {uc_rec} | {uc_pct:.2f}% | {log_or_str} | {or_str} | {ci_str} | {prob_str} | {note} |\n")
+        #         f.write(f"| {subgroup_result['subgroup']} | {n} | {n_ant} | {n_uc} | {antiox_rec} | {antiox_pct:.2f}% | {uc_rec} | {uc_pct:.2f}% | {log_or_str} | {or_str} | {ci_str} | {prob_str} | {note} |\n")
     
-    return results
+    return results, subgroup_results if subgroup_analysis else None
 
 
-def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, stan_file, max_time=14):
+def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, stan_file):
     """
     Perform subgroup analyses for secondary outcomes
     
@@ -417,8 +445,6 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
         Binary outcome column name
     stan_file : str
         Path to Stan model file
-    max_time : int
-        Maximum time cutoff
         
     Returns:
     --------
@@ -452,7 +478,7 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
     
     for subgroup_name, subgroup_mask in subgroups.items():
         print(f"Analyzing subgroup: {subgroup_name}")
-        subgroup_data = antiox_secondary[subgroup_mask].dropna(subset=[outcome_col, timerecovery_col, 'treatment'])
+        subgroup_data = antiox_secondary[subgroup_mask].dropna(subset=[outcome_col, 'treatment'])
         
         if len(subgroup_data) < 10 or subgroup_data['treatment'].nunique() < 2:
             subgroup_results.append({
@@ -477,7 +503,6 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
         treat_data = subgroup_data[subgroup_data['treatment'] == 1]
         control_data = subgroup_data[subgroup_data['treatment'] == 0]
         
-        
         y_sub = subgroup_data[outcome_col].values.astype(int)
         treatment_sub = subgroup_data['treatment'].values.astype(int)
         age_sub = subgroup_data['dem_age_calc'].values.astype(float)
@@ -492,6 +517,7 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
         comorb_std_sub = comorb_sub - np.mean(comorb_sub)
         
         result_entry = {
+            'timerecovery_col': timerecovery_col,   
             'subgroup': subgroup_name,
             'n': len(subgroup_data),
             'n_antioxidant': len(treat_data),
@@ -556,28 +582,7 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
 
 
 
-
-#######################################################################
-#############################################################################
-####### revise the secondary_binary_analysis function that include 
-####### the results of additional secondary analysis within subgroups and output: 
-####### log_or, OR, ci_lower, ci_upper, prob_superiority in markdown report  
-##############################################################################
-# Subgroups include: 
-# - dem_age_calc<=50, dem_age_calc>50; 
-# - dem_sex=1, dem_sex=2; 
-# - dem_race=1, dem_race!=1; 
-# - dem_house_income<=5, dem_house_income>5; 
-# - dem_comorb=1, dem_comorb=0; 
-# - dem_vaccination_status=2, dem_vaccination_status<2.
-#####################################################################
-
-
-
-
 if __name__ == '__main__':
-    # Create results directory
-    os.makedirs('results', exist_ok=True)
     
     
     # List of time-to-recovery columns to analyze
@@ -594,6 +599,7 @@ if __name__ == '__main__':
     
     # Run analysis for each recovery column
     all_results = {}
+    all_subgroup_results = []
     
     df_antiox = load_and_clean_raw_data("/workspaces/CTC_covid/data/CSV_RCC_Data_Export_ALL_Final_2025-05-15-Antiox.csv")
     # Extract key datasets
@@ -606,19 +612,27 @@ if __name__ == '__main__':
     
     for col in recovery_columns:
         if col in antiox_dd_agg.columns:
-            print(f"\n{'='*60}")
-            print(f"{'='*60}")
-            
+            print(f"\n{'='*80}")
             try:
-                results = secondary_binary_analysis(
+                col_results, col_subgroup_result = secondary_binary_analysis(
                     antiox_dd_agg, antiox_baseline, antiox_random, 
-                    timerecovery_col=col, max_time=14, subgroup_analysis=True, output_dir='/workspaces/CTC_covid/py_src/results_antiox'
+                    timerecovery_col=col, 
+                    max_time=14, 
+                    subgroup_analysis=True, 
+                    output_dir='/workspaces/CTC_covid/py_src/results_antiox'
                 )
-                all_results[col] = results
+                all_results[col] = col_results
+                all_subgroup_results.extend(col_subgroup_result)
                 
             except Exception as e:
                 print(f"Error analyzing {col}: {e}")
                 continue
         else:
             print(f"Column {col} not found in dataset")
+            
+    ## save subgroup results to csv
+    if all_subgroup_results is not None:
+        subgroup_df = pd.DataFrame(all_subgroup_results)
+        subgroup_df.to_csv(f'/workspaces/CTC_covid/py_src/results_antiox/secd_subgroup_results_all.csv', index=False, float_format='%.3f')
+
     

@@ -1,0 +1,29 @@
+# Ignore Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+
+# Ignore environment
+venv/
+env/
+ENV/
+
+# Ignore OS
+.DS_Store
+Thumbs.db
+
+# Ignore logs
+*.log
+
+# Add your specific folders/files below:
+.env
+archiv_ctc_antiox/
+antiox_ae.py
+antiox_intake.py
+antiox_med_260327.py
+antiox_secd_surv_250826.py
+plan_ctc_antiox.md
+Stan\ Code 
