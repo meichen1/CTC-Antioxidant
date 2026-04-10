@@ -74,5 +74,3 @@ Core dependencies are listed in requirements.txt, including:
 - statsmodels
 
 If Stan is not configured, scripts continue using fallback frequentist methods where implemented.
-
-If you want, I can also draft a slightly longer version with a small “Function map” section for each script (key functions and what each returns).
