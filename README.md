@@ -73,4 +73,3 @@ Core dependencies are listed in requirements.txt, including:
 - cmdstanpy
 - statsmodels
 
-If Stan is not configured, scripts continue using fallback frequentist methods where implemented.
