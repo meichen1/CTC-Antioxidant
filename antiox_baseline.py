@@ -1,6 +1,7 @@
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 
 def replace_empty_with_none(df):
@@ -18,10 +19,10 @@ rcc_ids_in_antiox = (
     df_antiox[df_antiox['redcap_event_name'] == 'Randomization']
     .sort_values('rand_date')
     ['participant_id']
-    .head(5)
+    .head(4)
     .tolist()
 )
-rcc_ids_in_antiox.pop(3)
+print("Participant IDs in Randomization event (first 4):", rcc_ids_in_antiox)
 
 # Drop all the rows with participant_id in rcc_ids_in_antiox
 df_antiox = df_antiox[~df_antiox['participant_id'].isin(rcc_ids_in_antiox)]
@@ -43,11 +44,9 @@ df_antiox = df_antiox[~df_antiox['participant_id'].isin(rcc_ids_in_antiox)]
 #  'Visit Date_complete']]
 
 # antiox_followup_eligible_agg = antiox_followup_eligible.groupby('participant_id').agg('first').reset_index()
-
 # id_to_remove = (
 #     df_antiox[df_antiox['end_study_reason'].isin([4,6])]['participant_id'].to_list()
 # )
-
 # df_antiox = df_antiox[~df_antiox['participant_id'].isin(id_to_remove)]
 
 
@@ -64,8 +63,7 @@ antiox_random = df_antiox[df_antiox['redcap_event_name'] == 'Randomization']
 antiox_random = antiox_random.dropna(axis=1, how='all')
 antiox_random = replace_empty_with_none(antiox_random)
 antiox_random.head()
-## 
-antiox_random.redcap_study.value_counts()
+## antiox_random.redcap_study.value_counts()
 
 
 ##############################################################
@@ -85,21 +83,19 @@ antiox_end.end_study_reason.value_counts()
 antiox_treatment = df_antiox[df_antiox['redcap_event_name']=='Study treatment']
 antiox_treatment = antiox_treatment.dropna(axis=1, how='all')
 antiox_treatment = replace_empty_with_none(antiox_treatment)
-print(antiox_treatment.shape)
 
 antiox_treatment.end_treat_yn.value_counts()
 antiox_treatment.end_treat_reason.value_counts()
 
 
-##########################
-########################
-#############################
+##########################################################
+######################## dd table ##########################
+##############################################################
 
 antiox_dd = df_antiox[df_antiox['redcap_event_name'].str.contains('Diar', na=False)]
 antiox_dd = antiox_dd.dropna(axis=1, how='all')
 antiox_dd = replace_empty_with_none(antiox_dd)
-print(antiox_dd.shape)
-antiox_dd.head()
+# antiox_dd.head()
 
 
 # Combine pdd_ and fpp_ columns using combine_first
@@ -134,15 +130,18 @@ antiox_dd_agg['take_over_10doses'] = antiox_dd_agg['num_med_doses'] >= 10
 #########################################################################
 ######################### baseline table #############################
 ##########################################################################
+
 antiox_baseline = df_antiox[df_antiox['redcap_event_name'] == 'Baseline']
 antiox_baseline = antiox_baseline.dropna(axis=1, how='all')
 antiox_baseline = replace_empty_with_none(antiox_baseline)
 
-antiox_baseline = antiox_baseline.merge(antiox_random[['participant_id', 'rand_group','symp_onset_date','rand_date']], on='participant_id', how='left')
 
+### merge randomization table  treatment table and dd table to baseline table
+antiox_baseline = antiox_baseline.merge(antiox_random[['participant_id', 'rand_group','symp_onset_date','rand_date']], on='participant_id', how='left')
 antiox_baseline = antiox_baseline.merge(antiox_dd_agg, on='participant_id', how='left')
 # Drop columns start with wk or wend
-antiox_baseline = antiox_baseline.loc[:, ~antiox_baseline.columns.str.startswith(('wk', 'wend'))]
+antiox_baseline = antiox_baseline.loc[:, ~antiox_baseline.columns.str.startswith(('wk', 'wend'))& ~antiox_baseline.columns.str.contains('redcap_record_metadata')]
+antiox_baseline = antiox_baseline.merge(antiox_treatment[['participant_id', 'end_treat_yn']], on='participant_id', how='left')
 
 antiox_baseline['symp_onset_date'] = pd.to_datetime(antiox_baseline['symp_onset_date'], errors='coerce')
 antiox_baseline['visit_date'] = pd.to_datetime(antiox_baseline['visit_date'], errors='coerce')
@@ -153,8 +152,7 @@ antiox_baseline['duration_symp'] = antiox_baseline['duration_symp'].dt.days
 antiox_baseline.head()
 antiox_baseline['dem_age_calc'].describe()
 antiox_baseline[antiox_baseline['dem_age_calc']==0] ## participand_id: 1002
-# print(antiox_baseline.loc[antiox_baseline['participant_id']=='1-1002','dem_age_calc'])
-
+## print(antiox_baseline.loc[antiox_baseline['participant_id']=='1-1002','dem_age_calc'])
 antiox_baseline.loc[antiox_baseline['dem_age_calc']==0, 'dem_age_calc'] =  (pd.to_datetime(antiox_baseline.loc[antiox_baseline['dem_age_calc']==0, 'rand_date'])  -  pd.to_datetime(antiox_baseline.loc[antiox_baseline['dem_age_calc']==0, 'dem_dob'])).dt.days//365.2425
 
 
@@ -273,6 +271,7 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
         'duration_symptoms': 'duration_symp',
         'took_5_doses': 'take_over_5doses',
         'took_10_doses': 'take_over_10doses',
+        'finish_treatment': 'end_treat_yn',
         'vax_doses': 'dem_vaccination_status',
         'bmi': 'bmi',
         # symptoms
@@ -305,16 +304,49 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
     counts = df.groupby('rand_group')['participant_id'].nunique()
     counts = counts.reindex(groups).fillna(0).astype(int)
     overall_n = df['participant_id'].nunique()
-    header = ['metric'] + [f"{g} (N={counts.loc[g]})" for g in groups] + [f"Overall (N={overall_n})"]
+    header = ['metric'] + [f"{g} (N={counts.loc[g]})" for g in groups] + [f"Overall (N={overall_n})"] + ['p_value']
 
-    def add_row_scalar(label, func):
+    def ttest_pvalue(col):
+        """Two-sample t-test p-value for a continuous column between the two groups."""
+        try:
+            grp_vals = [pd.to_numeric(df.loc[df['rand_group'] == g, col], errors='coerce').dropna() for g in groups]
+            if len(grp_vals) == 2 and len(grp_vals[0]) > 1 and len(grp_vals[1]) > 1:
+                _, p = stats.ttest_ind(grp_vals[0], grp_vals[1])
+                return f"{p:.3f}"
+        except Exception:
+            pass
+        return ''
+
+    # def mannwhitney_pvalue(col):
+    #     """Mann-Whitney U test p-value for a continuous column between the two groups."""
+    #     try:
+    #         grp_vals = [pd.to_numeric(df.loc[df['rand_group'] == g, col], errors='coerce').dropna() for g in groups]
+    #         if len(grp_vals) == 2 and len(grp_vals[0]) > 0 and len(grp_vals[1]) > 0:
+    #             _, p = stats.mannwhitneyu(grp_vals[0], grp_vals[1], alternative='two-sided')
+    #             return f"{p:.3f}"
+    #     except Exception:
+    #         pass
+    #     return ''
+
+    def chi_square_pvalue(col):
+        """Chi-square test p-value for a categorical column between the two groups."""
+        try:
+            ct = pd.crosstab(df['rand_group'], df[col])
+            if ct.shape[0] >= 2 and ct.shape[1] >= 2:
+                _, p, _, _ = stats.chi2_contingency(ct)
+                return f"{p:.3f}"
+        except Exception:
+            pass
+        return ''
+
+    def add_row_scalar(label, func, pval=''):
         vals = []
         for g in groups:
             sub = df[df['rand_group'] == g]
             vals.append(func(sub))
         # overall
         vals.append(func(df))
-        rows.append([label] + vals)
+        rows.append([label] + vals + [pval])
 
     # Age
     age_col = used.get('age')
@@ -324,9 +356,9 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
             if len(s) == 0:
                 return ''
             return f"{s.mean():.1f} ({s.std(ddof=0):.1f}) [{s.min():.0f},{s.max():.0f}]"
-        add_row_scalar('Age, mean(SD) [min,max]', age_stat)
+        add_row_scalar('Age, mean(SD) [min,max]', age_stat, pval=ttest_pvalue(age_col))
     else:
-        rows.append(['Age, mean(SD) [min,max]'] + [''] * (len(groups) + 1))
+        rows.append(['Age, mean(SD) [min,max]'] + [''] * (len(groups) + 1) + [''])
 
     # Sex
     sex_col = used.get('sex')
@@ -345,11 +377,12 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
             3: 'Intersex'
         }
         for label in sex_dict.keys():
-            add_row_scalar(f"Sex: {sex_dict[label]}", lambda sub, lbl=label: sex_counts_for(sub, lbl))
+            add_row_scalar(f"Sex: {sex_dict[label]}", lambda sub, lbl=label: sex_counts_for(sub, lbl),
+                           pval=chi_square_pvalue(sex_col))
         add_row_scalar("Sex: Missing", lambda sub: n_pct(sub.get(sex_col).isnull()))
     else:
         for label in sex_dict.keys():
-            rows.append([f"Sex: {sex_dict[label]}"] + [''] * (len(groups) + 1))
+            rows.append([f"Sex: {sex_dict[label]}"] + [''] * (len(groups) + 1) + [''])
 
     # Ethnicity - try to present top-level categories if available
     eth_col = used.get('ethnicity')
@@ -358,11 +391,12 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
         present = {1: 'White', 4: 'Asian', 2: 'Black', 5: 'Indigeneous', 9: 'Mixed', 99: 'Other'} # 3: 'Latino',
        
         for cat in present.keys():
-            add_row_scalar(f"Ethnicity: {present[cat]}", lambda sub, cat=cat: n_pct(sub.get(eth_col), cat))
+            add_row_scalar(f"Ethnicity: {present[cat]}", lambda sub, cat=cat: n_pct(sub.get(eth_col), cat),
+                           pval=chi_square_pvalue(eth_col))
 
         add_row_scalar("Ethnicity: Missing", lambda sub: n_pct(sub.get(eth_col).isnull()))
     else:
-        rows.append(["Ethnicity: (no column found)"] + [''] * (len(groups) + 1))
+        rows.append(["Ethnicity: (no column found)"] + [''] * (len(groups) + 1) + [''])
 
     # Duration symptoms: mean(SD) and median(IQR)
     dur_col = used.get('duration_symptoms')
@@ -379,11 +413,11 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
             q1 = s.quantile(0.25)
             q3 = s.quantile(0.75)
             return f"{s.median():.1f} ({q1:.1f},{q3:.1f})"
-        add_row_scalar('Duration symptoms at baseline in days, mean(SD)', dur_mean_sd)
-        add_row_scalar('Duration symptoms at baseline in days, median(IQR)', dur_median_iqr)
+        add_row_scalar('Duration symptoms at baseline in days, mean(SD)', dur_mean_sd, pval=ttest_pvalue(dur_col))
+        add_row_scalar('Duration symptoms at baseline in days, median(IQR)', dur_median_iqr, pval=ttest_pvalue(dur_col))
     else:
-        rows.append(['Duration symptoms at baseline in days, mean(SD)'] + [''] * (len(groups) + 1))
-        rows.append(['Duration symptoms at baseline in days, median(IQR)'] + [''] * (len(groups) + 1))
+        rows.append(['Duration symptoms at baseline in days, mean(SD)'] + [''] * (len(groups) + 1) + [''])
+        rows.append(['Duration symptoms at baseline in days, median(IQR)'] + [''] * (len(groups) + 1) + [''])
 
 
     # Vaccine doses (categorical)
@@ -392,11 +426,12 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
 
         vax_dict = {0:'None', 1:'Less than 2 doses', 2:'2 doses or more'}
         for label in vax_dict.keys():
-            add_row_scalar(f"Number of vaccine doses: {vax_dict[label]}", lambda sub, lbl=label: n_pct(sub.get(vax_col), lbl))
+            add_row_scalar(f"Number of vaccine doses: {vax_dict[label]}", lambda sub, lbl=label: n_pct(sub.get(vax_col), lbl),
+                           pval=chi_square_pvalue(vax_col))
         add_row_scalar("Number of vaccine doses: Missing", lambda sub: n_pct(sub.get(vax_col).isnull()))
     else:
         for label in ['None', 'Less than 2', '2 or more', 'Missing']:
-            rows.append([f"Number of vaccine doses: {label}"] + [''] * (len(groups) + 1))
+            rows.append([f"Number of vaccine doses: {label}"] + [''] * (len(groups) + 1) + [''])
 
     # BMI
     bmi_col = used.get('bmi')
@@ -408,9 +443,9 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
             q1 = s.quantile(0.25)
             q3 = s.quantile(0.75)
             return f"{s.median():.1f} ({q1:.1f},{q3:.1f})"
-        add_row_scalar('Body Mass Index, median(IQR)', bmi_median_iqr)
+        add_row_scalar('Body Mass Index, median(IQR)', bmi_median_iqr, pval=ttest_pvalue(bmi_col))
     else:
-        rows.append(['Body Mass Index, median(IQR)'] + [''] * (len(groups) + 1))
+        rows.append(['Body Mass Index, median(IQR)'] + [''] * (len(groups) + 1) + [''])
 
     # Baseline symptoms - iterate through some common symptoms
     symptom_keys = ['fever', 
@@ -430,15 +465,17 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
             levels = {0:'No problem', 1:'Mild problem', 2:'Moderate problem', 3:'Major problem'}
             
             for lev in levels.keys():
-                add_row_scalar(f"{col}: {levels[lev]}", lambda sub, lev=lev, c=col: n_pct(sub.get(c), lev))
+                add_row_scalar(f"{col}: {levels[lev]}", lambda sub, lev=lev, c=col: n_pct(sub.get(c), lev),
+                               pval=chi_square_pvalue(col))
             
             add_row_scalar(f"{col}: Missing", lambda sub, c=col: n_pct(sub.get(c).isnull()))
         else:
-            rows.append([f"{key}: (no column found)"] + [''] * (len(groups) + 1))
+            rows.append([f"{key}: (no column found)"] + [''] * (len(groups) + 1) + [''])
 
     # Comorbidities - show n(%) for each comorbidity and missing
     for key in ['took_5_doses',
                 'took_10_doses',
+                'finish_treatment',
                 'any_symptom_rated_moderate_or_major',
                 'lung disease',
                 'liver disease',
@@ -452,24 +489,33 @@ def summarize_baseline(df, out_csv='/workspaces/CTC_covid/py_src/results_antiox/
                 'any disease'
                 ]:
         col = used.get(key)
-        print(col)
         if col:
-            add_row_scalar(f"{key}, n(%)", lambda sub, c=col: n_pct(sub.get(c), True) if sub.get(c) is not None else '')
+            add_row_scalar(f"{key}, n(%)", lambda sub, c=col: n_pct(sub.get(c), True) if sub.get(c) is not None else '',
+                           pval=chi_square_pvalue(col))
             add_row_scalar(f"{key}: Missing", lambda sub, c=col: n_pct(sub.get(c).isnull()))
         else:
-            rows.append([f"{key}, n(%)"] + [''] * (len(groups) + 1))
-            rows.append([f"{key}: Missing"] + [''] * (len(groups) + 1))
+            rows.append([f"{key}, n(%)"] + [''] * (len(groups) + 1) + [''])
+            rows.append([f"{key}: Missing"] + [''] * (len(groups) + 1) + [''])
 
     
     # Compose DataFrame and save
     out_df = pd.DataFrame(rows, columns=header)
     out_df.to_csv(out_csv, index=False)
 
+    # Print statistically significant baseline differences (p < 0.05)
+    sig_rows = out_df[out_df['p_value'].apply(
+        lambda p: bool(p) and p not in ('', 'nan') and float(p) < 0.05 if p else False
+    )]
+    if len(sig_rows) > 0:
+        print('\n*** Significant baseline differences (p < 0.05) ***')
+        for _, row in sig_rows.iterrows():
+            print(f"  {row['metric']}: p = {row['p_value']}")
+    else:
+        print('\nNo significant baseline differences found (p < 0.05).')
+
     # print mapping of used columns
     print('\nBaseline summary complete. Output saved to:', out_csv)
-    print('Column mapping (detected -> column name or None):')
-    for k, v in used.items():
-        print(f"  {k}: {v}")
+   
 
     return out_df
 
@@ -480,6 +526,18 @@ if __name__ == '__main__':
         summary = summarize_baseline(antiox_baseline)
     except Exception as e:
         print('Error while summarizing baseline:', str(e))
+
+
+
+
+# *** Significant baseline differences (p < 0.05) ***
+#   covid_cough: No problem: p = 0.015
+#   covid_cough: Mild problem: p = 0.015
+#   covid_cough: Moderate problem: p = 0.015
+#   covid_cough: Major problem: p = 0.015
+
+
+
 
 
 

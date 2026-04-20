@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # from src_helper import first_change_to_1, ret_first_alleviation, ret_sustain_alleviation, sustain_change_to_1, ret_series, ret_indexof1
-from antiox_primary_2603 import load_and_clean_raw_data, extract_randomization_data, extract_baseline_data, extract_followup_data, extract_diary_data, aggregate_diary_data, standardize_covariates
+from antiox_primary_2603 import load_and_clean_raw_data, extract_randomization_data, extract_baseline_data, extract_followup_data, extract_diary_data, aggregate_diary_data, standardize_covariates, PAXLOVID_TAKERS
 STAN_FILE_RECOVERY = "/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code Recovery.stan"
 STAN_FILE_REGULARIZING = "/workspaces/CTC_covid/py_src/ctc_antiox/Stan Code Regularizing.stan"
 
@@ -62,6 +62,8 @@ def secondary_binary_analysis(antiox_dd_agg,
     
     # Convert treatment group: 1 for antioxidant, 0 for control
     antiox_secondary['treatment'] = (antiox_secondary['rand_group'] == 'Antioxidant').astype(int)
+    # Paxlovid covariate
+    antiox_secondary['take_paxlovid'] = antiox_secondary['participant_id'].isin(PAXLOVID_TAKERS).astype(int)
     # Create binary outcome: recovered by day max_time (1=yes, 0=no)
     antiox_secondary['recovered_by_day14'] = (antiox_secondary[timerecovery_col] <= max_time).astype(int)
     # Clean data - remove missing values
@@ -128,6 +130,7 @@ def secondary_binary_analysis(antiox_dd_agg,
     age = analysis_data['dem_age_calc'].values.astype(float)
     vaccination_status = analysis_data['dem_vaccination_status'].values.astype(int)
     comorb = analysis_data['dem_comorb'].values.astype(int)
+    paxlovid = analysis_data['take_paxlovid'].values.astype(int)
     
     # Handle missing values for age vaccination status, and comorbidity by imputation (mean for age, mode for categorical)
     age = np.where(np.isnan(age), np.nanmean(age), age)
@@ -136,6 +139,7 @@ def secondary_binary_analysis(antiox_dd_agg,
     
     # PANORAMIC-style analysis (continuous age + standardization)
     age_std, vaccination_status_std, comorb_std = standardize_covariates(age, vaccination_status, comorb)
+    paxlovid_std = paxlovid - np.mean(paxlovid)
     
     # # CanTreatCOVID-style analysis (age dichotomized at 65)
     # age_group_std = age_group - np.mean(age_group)
@@ -150,10 +154,10 @@ def secondary_binary_analysis(antiox_dd_agg,
         stan_data_pan = {
             'N': len(analysis_data),
             'J': 1,  # number of interventions
-            'M': 3,  # number of covariates
+            'M': 4,  # number of covariates (age, vaccination, comorb, paxlovid)
             'y': y.tolist(),
             'Z': treatment.reshape(-1, 1).tolist(),
-            'X': np.column_stack([age_std, vaccination_status_std, comorb_std]).tolist()
+            'X': np.column_stack([age_std, vaccination_status_std, comorb_std, paxlovid_std]).tolist()
         }
         
         # # CanTreatCOVID analysis
@@ -428,7 +432,7 @@ def secondary_binary_analysis(antiox_dd_agg,
 
         #         f.write(f"| {subgroup_result['subgroup']} | {n} | {n_ant} | {n_uc} | {antiox_rec} | {antiox_pct:.2f}% | {uc_rec} | {uc_pct:.2f}% | {log_or_str} | {or_str} | {ci_str} | {prob_str} | {note} |\n")
     
-    return results, subgroup_results if subgroup_analysis else None
+    return results, subgroup_results if subgroup_analysis else []
 
 
 def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, stan_file):
@@ -508,6 +512,7 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
         age_sub = subgroup_data['dem_age_calc'].values.astype(float)
         vax_sub = subgroup_data['dem_vaccination_status'].values.astype(int)
         comorb_sub = subgroup_data['dem_comorb'].values.astype(int)
+        paxlovid_sub = subgroup_data['take_paxlovid'].values.astype(int)
         
         # Standardize covariates
         age_mean = np.nanmean(age_sub)
@@ -515,6 +520,7 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
         age_std_sub = (age_sub - np.mean(age_sub)) / (4 * np.var(age_sub))**0.5 if np.var(age_sub) > 0 else (age_sub - np.mean(age_sub))
         vax_std_sub = vax_sub - np.mean(vax_sub)
         comorb_std_sub = comorb_sub - np.mean(comorb_sub)
+        paxlovid_std_sub = paxlovid_sub - np.mean(paxlovid_sub)
         
         result_entry = {
             'timerecovery_col': timerecovery_col,   
@@ -534,10 +540,10 @@ def subgroup_binary_analysis(antiox_secondary, timerecovery_col, outcome_col, st
                 stan_data_sub = {
                     'N': len(subgroup_data),
                     'J': 1,
-                    'M': 3,
+                    'M': 4,
                     'y': y_sub.tolist(),
                     'Z': treatment_sub.reshape(-1, 1).tolist(),
-                    'X': np.column_stack([age_std_sub, vax_std_sub, comorb_std_sub]).tolist()
+                    'X': np.column_stack([age_std_sub, vax_std_sub, comorb_std_sub, paxlovid_std_sub]).tolist()
                 }
                 
                 fit_sub = model.sample(data=stan_data_sub, chains=4, iter_sampling=10000, iter_warmup=5000, seed=42, show_console=False)
@@ -618,7 +624,7 @@ if __name__ == '__main__':
                     antiox_dd_agg, antiox_baseline, antiox_random, 
                     timerecovery_col=col, 
                     max_time=14, 
-                    subgroup_analysis=True, 
+                    subgroup_analysis=False, 
                     output_dir='/workspaces/CTC_covid/py_src/results_antiox'
                 )
                 all_results[col] = col_results

@@ -17,6 +17,10 @@ warnings.filterwarnings('ignore')
 ALPHA_LOC_HOSP = -3.48      # logit(0.03) ≈ -3.48, appropriate for ~3% hospitalization rate
 ALPHA_LOC_RECOVERY = 0.0    # logit(0.50) = 0, broad neutral prior for high recovery rates
 
+# Paxlovid takers: used as a binary covariate (1 = took Paxlovid, 0 = did not)
+# Antioxidant group: n=5; Usual Care group: n=2
+PAXLOVID_TAKERS = ['1-1021', '1-1024', '1-1028', '1-1038', '1-1041', '1-1054', '1-1057']
+
 try:
     from ctc_antiox.src_helper import first_change_to_1, ret_first_alleviation, ret_sustain_alleviation, sustain_change_to_1
 except ModuleNotFoundError:
@@ -257,8 +261,10 @@ def prepare_primary_outcome_dataset(antiox_dd_agg, antiox_followup, antiox_rando
     antiox_primary['dem_vac_orig'] = antiox_primary['dem_vaccination_status']
     antiox_primary['dem_vaccination_status'] = (antiox_primary['dem_vaccination_status'] > 0).astype(int)
     antiox_primary['rand_group'] = antiox_primary['rand_group'].map({'Antioxidant': 1, 'Usual Care': 0})
+    antiox_primary['take_paxlovid'] = antiox_primary['participant_id'].isin(PAXLOVID_TAKERS).astype(int)
     
     print(f"Primary outcome dataset shape: {antiox_primary.shape}")
+    print(f"Paxlovid takers in dataset: {antiox_primary['take_paxlovid'].sum()}")
     return antiox_primary
 
 
@@ -286,6 +292,7 @@ def prepare_early_recovery_dataset(antiox_dd_agg, antiox_random, antiox_baseline
     antiox_earlysus['dem_vaccination_status'] = (antiox_earlysus['dem_vaccination_status'] > 0).astype(int)
     antiox_earlysus['rand_group'] = antiox_earlysus['rand_group'].map({'Antioxidant': 1, 'Usual Care': 0})
     antiox_earlysus['pdd_recover_sustain_binary'] = (antiox_earlysus['pdd_recover_sustain_change_to_1'] <= 14).astype(int)
+    antiox_earlysus['take_paxlovid'] = antiox_earlysus['participant_id'].isin(PAXLOVID_TAKERS).astype(int)
     
     # # Remove any rows with missing values
     # antiox_earlysus = antiox_earlysus.dropna(axis=0, how='any')
@@ -403,11 +410,12 @@ def run_stan_analysis(stan_data, model, superiority_direction='lo', model_name="
         return None
 
 
-def run_frequentist_fallback(Z, X1_std, X2_std, X3_std, y):
+def run_frequentist_fallback(Z, X1_std, X2_std, X3_std, y, X4_std=None):
     """Unpenalized frequentist fallback using statsmodels logistic regression."""
     try:
         import statsmodels.api as sm
-        X_lr = np.column_stack([np.ones(len(y)), Z.flatten(), X1_std, X2_std, X3_std])
+        extra = [X4_std] if X4_std is not None else []
+        X_lr = np.column_stack([np.ones(len(y)), Z.flatten(), X1_std, X2_std, X3_std] + extra)
         logit_model = sm.Logit(y, X_lr)
         result = logit_model.fit(disp=0, maxiter=200)
         theta_mean = float(result.params[1])
@@ -440,26 +448,28 @@ def panoramic_analysis_hospitalization(antiox_primary, model, stan_model_availab
     X1 = analysis_data['dem_age_calc'].astype(float).values
     X2 = analysis_data['dem_vaccination_status'].astype(int).values
     X3 = analysis_data['dem_comorb'].astype(int).values
+    X4 = analysis_data['take_paxlovid'].astype(int).values
     ## impute missing values with mean (for continuous) or mode (for binary) - only for covariates, not outcome or treatment
     X1 = np.where(np.isnan(X1), np.nanmean(X1), X1)
     X2 = np.where(np.isnan(X2), np.round(np.nanmean(X2)), X2)
     X3 = np.where(np.isnan(X3), np.round(np.nanmean(X3)), X3)
     
     X1_std, X2_std, X3_std = standardize_covariates(X1, X2, X3, use_continuous_age=True)
+    X4_std = X4 - np.mean(X4)  # center paxlovid covariate
     
     stan_data = {
         'N': len(analysis_data),
         'J': 1,
-        'M': 3,
+        'M': 4,
         'y': y.tolist(),
         'Z': Z.reshape(-1, 1).tolist(),
-        'X': np.column_stack([X1_std, X2_std, X3_std]).tolist()
+        'X': np.column_stack([X1_std, X2_std, X3_std, X4_std]).tolist()
     }
     
     if stan_model_available:
         results = run_stan_analysis(stan_data, model, 'lo', "PANORAMIC Hospitalization")
     else:
-        results = run_frequentist_fallback(Z, X1_std, X2_std, X3_std, y)
+        results = run_frequentist_fallback(Z, X1_std, X2_std, X3_std, y, X4_std)
     
     if results:
         print(f"Treatment effect (log-OR): {results['theta_mean']:.3f} [{results['ci_low']:.3f}, {results['ci_high']:.3f}]")
@@ -541,6 +551,7 @@ def early_recovery_analysis(antiox_earlysus, model, stan_model_available, model_
     X1 = analysis_data['dem_age_calc'].astype(float).values
     X2 = analysis_data['dem_vaccination_status'].astype(int).values
     X3 = analysis_data['dem_comorb'].astype(int).values
+    X4 = analysis_data['take_paxlovid'].astype(int).values
     
     ## impute missing values with mean (for continuous) or mode (for binary) - only for covariates, not outcome or treatment
     X1 = np.where(np.isnan(X1), np.nanmean(X1), X1)
@@ -548,20 +559,21 @@ def early_recovery_analysis(antiox_earlysus, model, stan_model_available, model_
     X3 = np.where(np.isnan(X3), np.round(np.nanmean(X3)), X3)
     
     X1_std, X2_std, X3_std = standardize_covariates(X1, X2, X3, use_continuous_age=True)
+    X4_std = X4 - np.mean(X4)  # center paxlovid covariate
     
     stan_data = {
         'N': len(analysis_data),
         'J': 1,
-        'M': 3,
+        'M': 4,
         'y': y.tolist(),
         'Z': Z.reshape(-1, 1).tolist(),
-        'X': np.column_stack([X1_std, X2_std, X3_std]).tolist()
+        'X': np.column_stack([X1_std, X2_std, X3_std, X4_std]).tolist()
     }
     
     if stan_model_available:
         results = run_stan_analysis(stan_data, model, 'hi', "Early Recovery")
     else:
-        results = run_frequentist_fallback(Z, X1_std, X2_std, X3_std, y)
+        results = run_frequentist_fallback(Z, X1_std, X2_std, X3_std, y, X4_std)
     
     if results:
         print(f"Treatment effect (log-OR): {results['theta_mean']:.3f} [{results['ci_low']:.3f}, {results['ci_high']:.3f}]")
@@ -626,26 +638,28 @@ def subgroup_analysis(antiox_primary_subgroup, model, stan_model_available):
         X1_sub = analysis_subgroup['dem_age_calc'].astype(float).values
         X2_sub = analysis_subgroup['dem_vaccination_status'].astype(int).values
         X3_sub = analysis_subgroup['dem_comorb'].astype(int).values
+        X4_sub = analysis_subgroup['take_paxlovid'].astype(int).values
         
         ## impute missing values with mean (for continuous) or mode (for binary) - only for covariates, not outcome or treatment
         X1_sub = np.where(np.isnan(X1_sub), np.nanmean(X1_sub), X1_sub)
         X2_sub = np.where(np.isnan(X2_sub), np.round(np.nanmean(X2_sub)), X2_sub)
         X3_sub = np.where(np.isnan(X3_sub), np.round(np.nanmean(X3_sub)), X3_sub)
         X1_std_sub, X2_std_sub, X3_std_sub = standardize_covariates(X1_sub, X2_sub, X3_sub)
+        X4_std_sub = X4_sub - np.mean(X4_sub)
         
         stan_data_sub = {
             'N': len(analysis_subgroup),
             'J': 1,
-            'M': 3,
+            'M': 4,
             'y': y_sub.tolist(),
             'Z': Z_sub.reshape(-1, 1).tolist(),
-            'X': np.column_stack([X1_std_sub, X2_std_sub, X3_std_sub]).tolist()
+            'X': np.column_stack([X1_std_sub, X2_std_sub, X3_std_sub, X4_std_sub]).tolist()
         }
         
         if stan_model_available:
             results = run_stan_analysis(stan_data_sub, model, 'lo', f"Subgroup {subgroup_name}")
         else:
-            results = run_frequentist_fallback(Z_sub, X1_std_sub, X2_std_sub, X3_std_sub, y_sub)
+            results = run_frequentist_fallback(Z_sub, X1_std_sub, X2_std_sub, X3_std_sub, y_sub, X4_std_sub)
         
         if results:
             print(f"  Events: {y_sub.sum()}/{len(y_sub)} ({y_sub.mean()*100:.1f}%)")
@@ -794,22 +808,22 @@ if __name__ == '__main__':
 
     
     
-    # ========================================================================
-    # SUBGROUP ANALYSIS
-    # ========================================================================
+    # # ========================================================================
+    # # SUBGROUP ANALYSIS
+    # # ========================================================================
     
-    antiox_primary_subgroup = antiox_primary.merge(
-        antiox_baseline[['participant_id', 'dem_sex', 'dem_race', 'dem_house_income']], 
-        on='participant_id', 
-        how='left'
-    )
-    subgroup_results_list = subgroup_analysis(antiox_primary_subgroup, model_hosp, stan_model_available)
+    # antiox_primary_subgroup = antiox_primary.merge(
+    #     antiox_baseline[['participant_id', 'dem_sex', 'dem_race', 'dem_house_income']], 
+    #     on='participant_id', 
+    #     how='left'
+    # )
+    # subgroup_results_list = subgroup_analysis(antiox_primary_subgroup, model_hosp, stan_model_available)
     
-    ## Subgroup analysis results
-    if subgroup_results_list:
-        subgroup_df = pd.DataFrame(subgroup_results_list)
-        subgroup_df.to_csv('/workspaces/CTC_covid/py_src/results_antiox/antiox_primary_subgroup.csv', index=False, float_format='%.3f')
-        print(f"✓ Subgroup analysis results saved")
+    # ## Subgroup analysis results
+    # if subgroup_results_list:
+    #     subgroup_df = pd.DataFrame(subgroup_results_list)
+    #     subgroup_df.to_csv('/workspaces/CTC_covid/py_src/results_antiox/antiox_primary_subgroup.csv', index=False, float_format='%.3f')
+    #     print(f"✓ Subgroup analysis results saved")
     
 
 
