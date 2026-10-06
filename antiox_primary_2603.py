@@ -51,11 +51,16 @@ def remove_rcc_ids(df):
     """Remove specific RCC IDs from the dataset."""
     rcc_ids_in_antiox = (
         df[df['redcap_event_name'] == 'Randomization']
-        .sort_values('rand_date')
+        .sort_values(['rand_date', 'participant_id'])
         .head(4)['participant_id'].tolist()
     )
-    # rcc_ids_in_antiox.pop(3)
+
     print(f"Removing RCC IDs: {rcc_ids_in_antiox}")
+    expected_rcc_ids = ['3-1001', '3-1002', '3-1003', '3-1004']
+    if rcc_ids_in_antiox != expected_rcc_ids:
+        raise ValueError(
+            f"Expected RCC IDs {expected_rcc_ids}, got {rcc_ids_in_antiox}"
+        )
     return df[~df['participant_id'].isin(rcc_ids_in_antiox)]
 
 
