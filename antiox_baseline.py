@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from antiox_primary_2603 import load_and_clean_raw_data
+
 
 def replace_empty_with_none(df):
     """
@@ -12,20 +14,9 @@ def replace_empty_with_none(df):
         df[col_name] = df[col_name].replace(['', 'NA', 'N/A', 'na', 'NaN'], None)
     return df
 
-# Read CSV directly with pandas
-df_antiox = pd.read_csv("/workspaces/CTC_covid/data/CSV_RCC_Data_Export_ALL_Final_2025-05-15-Antiox.csv")
-
-rcc_ids_in_antiox = (
-    df_antiox[df_antiox['redcap_event_name'] == 'Randomization']
-    .sort_values('rand_date')
-    ['participant_id']
-    .head(4)
-    .tolist()
+df_antiox = load_and_clean_raw_data(
+    "/workspaces/CTC_covid/data/CSV_RCC_Data_Export_ALL_Final_2025-05-15-Antiox.csv"
 )
-print("Participant IDs in Randomization event (first 4):", rcc_ids_in_antiox)
-
-# Drop all the rows with participant_id in rcc_ids_in_antiox
-df_antiox = df_antiox[~df_antiox['participant_id'].isin(rcc_ids_in_antiox)]
 
 
 
@@ -527,14 +518,6 @@ if __name__ == '__main__':
     except Exception as e:
         print('Error while summarizing baseline:', str(e))
 
-
-
-
-# *** Significant baseline differences (p < 0.05) ***
-#   covid_cough: No problem: p = 0.015
-#   covid_cough: Mild problem: p = 0.015
-#   covid_cough: Moderate problem: p = 0.015
-#   covid_cough: Major problem: p = 0.015
 
 
 
